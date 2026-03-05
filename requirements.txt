@@ -1,0 +1,8 @@
+streamlit==1.50.0
+pandas==2.3.3
+requests
+beautifulsoup4
+lxml
+python-dateutil
+resend
+python-dotenv
