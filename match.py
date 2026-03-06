@@ -88,7 +88,7 @@ def compute_matches(conn: sqlite3.Connection, profile_name: str, keywords: List[
         """
         SELECT source, source_id, title, ca, estimated_value, published_at
         FROM tenders
-        WHERE source = 'ETENDERS_GOV_IE'
+        WHERE source IN ('ETENDERS_GOV_IE', 'TED')
         ORDER BY published_at DESC
         LIMIT 500;
         """

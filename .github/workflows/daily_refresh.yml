@@ -27,8 +27,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run scraper
+      - name: Run Irish scraper
         run: python scrape_etenders_govie_autopage.py
+
+      - name: Run TED scraper
+        run: python scrape_ted_api.py
 
       - name: Run matcher
         run: python match.py

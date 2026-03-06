@@ -22,6 +22,15 @@ bookmarks_only = st.sidebar.checkbox("Bookmarks only", value=False)
 only_with_deadline = st.sidebar.checkbox("Only tenders with a deadline", value=True)
 due_within = st.sidebar.slider("Due within (days)", 0, 180, 30)
 
+source_filter = st.sidebar.selectbox(
+    "Source",
+    ["All", "ETENDERS_GOV_IE", "TED"],
+    index=0
+)
+
+country_filter = st.sidebar.text_input("Country code (TED only)", value="")
+
+
 # Sorting
 sort_by = st.sidebar.selectbox(
     "Sort by",
@@ -51,6 +60,16 @@ if search.strip():
 # Optionally, you could filter in SQL too, but ISO timestamps + sqlite parsing can be finicky.
 
 params.append(limit)
+
+source_sql = ""
+if source_filter != "All":
+    source_sql = " AND t.source = ? "
+    params.append(source_filter)
+
+country_sql = ""
+if country_filter.strip():
+    country_sql = " AND lower(coalesce(t.country,'')) = lower(?) "
+    params.append(country_filter.strip())
 
 sql = f"""
 SELECT
@@ -83,8 +102,10 @@ SELECT
   t.title,
   t.ca,
   t.estimated_value,
-  t.link,      
-
+  t.source,
+  t.country,
+  t.cpv_code,
+  t.link,
   CASE WHEN b.source_id IS NULL THEN 0 ELSE 1 END AS bookmarked
 FROM tender_matches m
 JOIN tenders t
@@ -93,7 +114,10 @@ LEFT JOIN bookmarks b
   ON b.source = t.source AND b.source_id = t.source_id
 WHERE m.profile_name = ?
   AND m.score >= ?
-  AND t.source = 'ETENDERS_GOV_IE'
+  {source_sql}
+  {country_sql}
+  {search_sql}
+  AND t.source IN ('ETENDERS_GOV_IE', 'TED')
   {search_sql}
 ORDER BY {order_sql}
 LIMIT ?;
