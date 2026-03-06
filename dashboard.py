@@ -84,6 +84,7 @@ SELECT
   t.ca,
   t.estimated_value,
   t.link,
+  t.summary,
   CASE WHEN b.source_id IS NULL THEN 0 ELSE 1 END AS bookmarked
 FROM tender_matches m
 JOIN tenders t
