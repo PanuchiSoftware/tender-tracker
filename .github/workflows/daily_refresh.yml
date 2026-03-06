@@ -31,6 +31,7 @@ jobs:
         run: python match.py
 
       - name: Run summarizer
+        continue-on-error: true
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python summarize_tenders.py
