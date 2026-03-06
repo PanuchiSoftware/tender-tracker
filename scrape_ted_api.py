@@ -56,12 +56,17 @@ def expert_query() -> str:
 def post_search(page: int) -> Dict[str, Any]:
     payload = {
         "query": expert_query(),
+        "fields": ["publication-number"],
+        "limit": 10,
+        "scope": "ACTIVE",
+        "checkQuerySyntax": False,
+        "paginationMode": "ITERATION",
         "page": page,
-        "limit": PAGE_SIZE,
     }
 
     headers = {
         "Content-Type": "application/json",
+        "Accept": "*/*",
         "User-Agent": "TenderTracker/1.0",
     }
 
