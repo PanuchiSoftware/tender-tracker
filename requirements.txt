@@ -6,3 +6,4 @@ lxml
 python-dateutil
 resend
 python-dotenv
+openai

@@ -30,6 +30,11 @@ jobs:
       - name: Run matcher
         run: python match.py
 
+      - name: Run summarizer
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python summarize_tenders.py
+
       - name: Commit updated database
         run: |
           git config user.name "tender-bot"
