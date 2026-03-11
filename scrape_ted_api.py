@@ -2,15 +2,15 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+import xml.etree.ElementTree as ET
+import time
 
 import requests
 
 DB_PATH = "tenders.db"
 TED_SEARCH_URL = "https://api.ted.europa.eu/v3/notices/search"
 
-# Start small
-PAGE_SIZE = 50
+PAGE_SIZE = 10
 MAX_PAGES = 5
 LOOKBACK_DAYS = 14
 
@@ -33,23 +33,9 @@ class Tender:
     source_url: Optional[str]
 
 
-def normalize_dt(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    value = str(value).strip()
-    try:
-        # Handles ISO-like values if TED gives them
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return dt.astimezone(timezone.utc).isoformat()
-    except Exception:
-        return value
-
-
 def expert_query() -> str:
     today = datetime.now(timezone.utc).date()
     since = today - timedelta(days=LOOKBACK_DAYS)
-    # TED help docs show expert search supports publication-date queries like publication-date=YYYYMMDD.
-    # We use a range.
     return f"publication-date>={since.strftime('%Y%m%d')} AND publication-date<={today.strftime('%Y%m%d')}"
 
 
@@ -57,7 +43,7 @@ def post_search(page: int) -> Dict[str, Any]:
     payload = {
         "query": expert_query(),
         "fields": ["publication-number"],
-        "limit": 10,
+        "limit": PAGE_SIZE,
         "scope": "ACTIVE",
         "checkQuerySyntax": False,
         "paginationMode": "ITERATION",
@@ -80,66 +66,188 @@ def post_search(page: int) -> Dict[str, Any]:
     return resp.json()
 
 
-def pick(d: Dict[str, Any], *keys: str) -> Optional[Any]:
-    for k in keys:
-        if k in d and d[k] not in (None, "", []):
-            return d[k]
+def extract_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return payload.get("notices", [])
+
+
+def normalize_dt(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    value = str(value).strip()
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return value
+
+
+def fetch_notice_xml(xml_url: str) -> Optional[ET.Element]:
+    headers = {"User-Agent": "TenderTracker/1.0"}
+
+    for attempt in range(3):
+        try:
+            resp = requests.get(xml_url, headers=headers, timeout=60)
+
+            if resp.status_code == 429:
+                wait = 2 * (attempt + 1)
+                print(f"Rate limited on {xml_url}, waiting {wait}s...")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            return ET.fromstring(resp.content)
+
+        except Exception as e:
+            if attempt == 2:
+                print(f"Failed to fetch/parse XML: {xml_url} -> {e}")
+                return None
+            time.sleep(2)
+
     return None
 
 
-def first_list_value(value: Any) -> Optional[Any]:
-    if isinstance(value, list) and value:
-        return value[0]
-    return value
+def local_name(tag: str) -> str:
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def first_text_by_localname(root: ET.Element, names: List[str]) -> Optional[str]:
+    names_set = set(names)
+    for el in root.iter():
+        if local_name(el.tag) in names_set:
+            text = (el.text or "").strip()
+            if text:
+                return text
+    return None
+
+
+def all_texts_by_localname(root: ET.Element, names: List[str]) -> List[str]:
+    names_set = set(names)
+    results = []
+    for el in root.iter():
+        if local_name(el.tag) in names_set:
+            text = (el.text or "").strip()
+            if text:
+                results.append(text)
+    return results
+
+
+def find_text_under_path(root: ET.Element, parent_names: List[str], target_names: List[str]) -> Optional[str]:
+    parent_set = set(parent_names)
+    target_set = set(target_names)
+
+    for parent in root.iter():
+        if local_name(parent.tag) in parent_set:
+            for child in parent.iter():
+                if local_name(child.tag) in target_set:
+                    text = (child.text or "").strip()
+                    if text:
+                        return text
+    return None
+
+
+def parse_notice_detail_xml(root: ET.Element) -> Dict[str, Optional[str]]:
+    # Better title extraction
+    title = (
+        find_text_under_path(root, ["ProcurementProjectLot", "ProcurementProject"], ["Name", "Title"])
+        or find_text_under_path(root, ["TenderResult"], ["Description"])
+        or None
+    )
+
+    # Dates
+    publication_date = first_text_by_localname(root, ["PublicationDate", "IssueDate"])
+    deadline_date = first_text_by_localname(root, ["ReceiptDeadlineDate", "EndDate"])
+
+    # Buyer / authority
+    buyer_name = find_text_under_path(root, ["ContractingParty", "Organization", "PartyName"], ["Name"]) \
+        or first_text_by_localname(root, ["Name"])
+
+    # Country
+    country = first_text_by_localname(root, ["IdentificationCode"])
+
+    # CPV
+    cpv_codes = all_texts_by_localname(root, ["ItemClassificationCode"])
+    cpv_code = cpv_codes[0] if cpv_codes else None
+
+    # Estimated value
+    estimated_value = first_text_by_localname(
+        root,
+        ["EstimatedOverallContractAmount", "ValueAmount", "PayableAmount"]
+    )
+
+    return {
+        "title": title,
+        "published_at": normalize_dt(publication_date),
+        "deadline_at": normalize_dt(deadline_date),
+        "ca": buyer_name,
+        "country": country,
+        "cpv_code": cpv_code,
+        "estimated_value": estimated_value,
+    }
 
 
 def parse_notice(item: Dict[str, Any]) -> Tender:
-    # TED response shapes may vary, so we read defensively.
-    title = first_list_value(pick(item, "title", "noticeTitle", "officialTitle")) or "Untitled notice"
+    notice_id = str(item.get("publication-number") or "").strip()
 
-    notice_id = str(first_list_value(pick(item, "noticeId", "id", "publicationNumber", "tedId")) or "")
-    source_id = notice_id or str(first_list_value(pick(item, "id")) or "")
+    links = item.get("links", {}) or {}
+    xml_links = links.get("xml", {}) or {}
+    html_links = links.get("html", {}) or {}
+    html_direct_links = links.get("htmlDirect", {}) or {}
 
-    country = first_list_value(pick(item, "country", "buyerCountry", "countryCode"))
-    cpv_code = first_list_value(pick(item, "cpvCode", "mainCpvCode", "mainCPV"))
-    cpv_label = first_list_value(pick(item, "cpvLabel", "mainCpvLabel", "mainCPVLabel"))
+    xml_url = xml_links.get("MUL")
+    source_url = (
+        html_links.get("ENG")
+        or html_direct_links.get("ENG")
+        or f"https://ted.europa.eu/en/notice/-/detail/{notice_id}"
+    )
 
-    published_at = normalize_dt(first_list_value(pick(item, "publicationDate", "publishedAt", "datePublished")))
-    deadline_at = normalize_dt(first_list_value(pick(item, "deadline", "submissionDeadline", "deadlineDate")))
+    detail = {
+        "title": None,
+        "published_at": None,
+        "deadline_at": None,
+        "ca": None,
+        "country": None,
+        "cpv_code": None,
+        "estimated_value": None,
+    }
 
-    ca = first_list_value(pick(item, "buyerName", "contractingAuthority", "organisationName", "organizationName"))
-    status = first_list_value(pick(item, "noticeType", "type", "formType"))
-    estimated_value = str(first_list_value(pick(item, "estimatedValue", "value"))) if pick(item, "estimatedValue", "value") else None
+    if xml_url:
+        time.sleep(0.4)
+        root = fetch_notice_xml(xml_url)
+        if root is not None:
+            # DEBUG: print the first few XML tags for the first notice
+            if notice_id == "120581-2026":
+                print("\nFIRST XML TAGS SAMPLE:\n")
+                seen = []
+                for el in root.iter():
+                    tag_name = local_name(el.tag)
+                    if tag_name not in seen:
+                        seen.append(tag_name)
+                    if len(seen) >= 80:
+                        break
+                print(seen)
+    
+            detail = parse_notice_detail_xml(root)
 
-    source_url = first_list_value(pick(item, "url", "noticeUrl", "tedUrl"))
-    if not source_url and notice_id:
-        source_url = f"https://ted.europa.eu/en/notice/-/detail/{quote(notice_id)}"
+    title = detail["title"] or f"TED Notice {notice_id}"
 
     return Tender(
         source="TED",
-        source_id=source_id or source_url or title,
-        title=str(title),
-        link=source_url or "",
-        ca=str(ca) if ca else None,
-        published_at=published_at,
-        deadline_at=deadline_at,
-        status=str(status) if status else None,
-        estimated_value=estimated_value,
+        source_id=notice_id or source_url,
+        title=title,
+        link=source_url,
+        ca=detail["ca"],
+        published_at=detail["published_at"],
+        deadline_at=detail["deadline_at"],
+        status=None,
+        estimated_value=detail["estimated_value"],
         notice_id=notice_id or None,
-        country=str(country) if country else None,
-        cpv_code=str(cpv_code) if cpv_code else None,
-        cpv_label=str(cpv_label) if cpv_label else None,
+        country=detail["country"],
+        cpv_code=detail["cpv_code"],
+        cpv_label=None,
         source_url=source_url,
     )
-
-
-def extract_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # TED response may use different top-level keys depending on version/result type.
-    for key in ("results", "items", "notices", "content"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            return value
-    return []
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -228,7 +336,7 @@ def print_latest(conn: sqlite3.Connection, limit: int = 10) -> None:
         SELECT published_at, country, cpv_code, title, ca, link
         FROM tenders
         WHERE source = 'TED'
-        ORDER BY published_at DESC
+        ORDER BY rowid DESC
         LIMIT ?;
         """,
         (limit,),
