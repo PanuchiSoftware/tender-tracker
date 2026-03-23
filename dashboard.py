@@ -13,9 +13,6 @@ from db import get_conn, is_postgres
 st.set_page_config(page_title="Tender Tracker", layout="wide")
 
 
-def ph() -> str:
-    return "%s" if is_postgres() else "?"
-
 
 def logout():
     st.session_state.pop("user", None)

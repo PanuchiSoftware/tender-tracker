@@ -21,3 +21,7 @@ def get_conn():
         return psycopg2.connect(db_url)
 
     return sqlite3.connect("tenders.db")
+
+
+def ph():
+    return "%s" if is_postgres() else "?"

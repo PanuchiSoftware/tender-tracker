@@ -4,7 +4,7 @@ import hashlib
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
-from db import get_conn
+from db import get_conn, ph
 
 
 def hash_password(password: str, salt: Optional[bytes] = None) -> str:
@@ -46,27 +46,34 @@ def create_user(email: str, password: str) -> Tuple[bool, str]:
 
     password_hash = hash_password(password)
     created_at = datetime.now(timezone.utc).isoformat()
+    p = ph()
 
     with get_conn() as conn:
         cur = conn.cursor()
 
         cur.execute(
-            "SELECT id FROM users WHERE email = ?",
+            f"SELECT id FROM users WHERE email = {p}",
             (email,)
         )
 
         if cur.fetchone():
             return False, "User already exists."
 
-        cur.execute(
-            "INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)",
-            (email, password_hash, created_at),
-        )
+        if p == "%s":
+            cur.execute(
+                "INSERT INTO users (email, password_hash, created_at) VALUES (%s, %s, %s) RETURNING id",
+                (email, password_hash, created_at),
+            )
+            user_id = cur.fetchone()[0]
+        else:
+            cur.execute(
+                "INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)",
+                (email, password_hash, created_at),
+            )
+            user_id = cur.lastrowid
 
-        user_id = cur.lastrowid
-
         cur.execute(
-            """
+            f"""
             INSERT INTO user_profiles (
                 user_id,
                 profile_name,
@@ -79,7 +86,7 @@ def create_user(email: str, password: str) -> Tuple[bool, str]:
                 search_text,
                 sort_by
             )
-            VALUES (?, 'Default', 0, 'All', '', '', 0, 180, '', 'priority desc (recommended)')
+            VALUES ({p}, 'Default', 0, 'All', '', '', 0, 180, '', 'priority desc (recommended)')
             """,
             (user_id,),
         )
@@ -91,12 +98,13 @@ def create_user(email: str, password: str) -> Tuple[bool, str]:
 
 def authenticate_user(email: str, password: str) -> Tuple[bool, Optional[dict]]:
     email = email.strip().lower()
+    p = ph()
 
     with get_conn() as conn:
         cur = conn.cursor()
 
         cur.execute(
-            "SELECT id, email, password_hash FROM users WHERE email = ?",
+            f"SELECT id, email, password_hash FROM users WHERE email = {p}",
             (email,),
         )
 
@@ -114,11 +122,13 @@ def authenticate_user(email: str, password: str) -> Tuple[bool, Optional[dict]]:
 
 
 def get_user_profile(user_id: int) -> dict:
+    p = ph()
+
     with get_conn() as conn:
         cur = conn.cursor()
 
         cur.execute(
-            """
+            f"""
             SELECT
                 profile_name,
                 min_score,
@@ -130,7 +140,7 @@ def get_user_profile(user_id: int) -> dict:
                 search_text,
                 sort_by
             FROM user_profiles
-            WHERE user_id = ?
+            WHERE user_id = {p}
             """,
             (user_id,),
         )
@@ -175,23 +185,25 @@ def save_user_profile(
     search_text: str,
     sort_by: str,
 ):
+    p = ph()
+
     with get_conn() as conn:
         cur = conn.cursor()
 
         cur.execute(
-            """
+            f"""
             UPDATE user_profiles
             SET
-                profile_name = ?,
-                min_score = ?,
-                source_filter = ?,
-                country_filter = ?,
-                cpv_filter = ?,
-                only_with_deadline = ?,
-                due_within = ?,
-                search_text = ?,
-                sort_by = ?
-            WHERE user_id = ?
+                profile_name = {p},
+                min_score = {p},
+                source_filter = {p},
+                country_filter = {p},
+                cpv_filter = {p},
+                only_with_deadline = {p},
+                due_within = {p},
+                search_text = {p},
+                sort_by = {p}
+            WHERE user_id = {p}
             """,
             (
                 profile_name,
@@ -211,30 +223,48 @@ def save_user_profile(
 
 
 def toggle_user_bookmark(user_id: int, source: str, source_id: str, value: bool):
+    p = ph()
+
     with get_conn() as conn:
         cur = conn.cursor()
 
         if value:
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO user_bookmarks
-                (user_id, source, source_id, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    source,
-                    source_id,
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
+            if p == "%s":
+                cur.execute(
+                    """
+                    INSERT INTO user_bookmarks
+                    (user_id, source, source_id, created_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id, source, source_id) DO NOTHING
+                    """,
+                    (
+                        user_id,
+                        source,
+                        source_id,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO user_bookmarks
+                    (user_id, source, source_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        source,
+                        source_id,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
         else:
             cur.execute(
-                """
+                f"""
                 DELETE FROM user_bookmarks
-                WHERE user_id = ?
-                AND source = ?
-                AND source_id = ?
+                WHERE user_id = {p}
+                AND source = {p}
+                AND source_id = {p}
                 """,
                 (user_id, source, source_id),
             )
