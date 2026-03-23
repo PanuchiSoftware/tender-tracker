@@ -43,7 +43,7 @@ def fetch_one(sql: str, params=None):
 
 
 def login_ui():
-    st.title("Tender Tracker (Beta)")
+    st.title("Tender Tracker - Login")
     st.info(
         "Free early access while we improve coverage, matching, translation, and alerts."
     )
