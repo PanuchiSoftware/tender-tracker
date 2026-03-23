@@ -8,7 +8,7 @@ from auth import (
     save_user_profile,
     toggle_user_bookmark,
 )
-from db import get_conn, is_postgres
+from db import get_conn, is_postgres, ph
 
 st.set_page_config(page_title="Tender Tracker", layout="wide")
 
