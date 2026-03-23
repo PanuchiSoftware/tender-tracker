@@ -1,6 +1,3 @@
-import sqlite3
-from datetime import datetime
-
 import pandas as pd
 import streamlit as st
 
@@ -11,10 +8,13 @@ from auth import (
     save_user_profile,
     toggle_user_bookmark,
 )
-
-DB_PATH = "tenders.db"
+from db import get_conn, is_postgres
 
 st.set_page_config(page_title="Tender Tracker", layout="wide")
+
+
+def ph() -> str:
+    return "%s" if is_postgres() else "?"
 
 
 def logout():
@@ -22,8 +22,36 @@ def logout():
     st.rerun()
 
 
+def fetch_df(sql: str, params=None) -> pd.DataFrame:
+    if params is None:
+        params = []
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+        columns = [desc[0] for desc in cur.description]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def fetch_one(sql: str, params=None):
+    if params is None:
+        params = []
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        return cur.fetchone()
+
+
 def login_ui():
-    st.title("Tender Tracker – Login")
+    st.title("Tender Tracker (Beta)")
+    st.info(
+        "Free early access while we improve coverage, matching, translation, and alerts."
+    )
+    st.write(
+        "Tender Tracker monitors public procurement opportunities across Ireland and Europe, "
+        "then ranks them based on relevance to your business."
+    )
+    st.caption("Support: support@panuchisoftwareservices.ie")
 
     tab1, tab2 = st.tabs(["Login", "Create account"])
 
@@ -59,6 +87,9 @@ user = st.session_state["user"]
 user_id = user["id"]
 
 st.title("Tender Tracker – Ranked Matches")
+st.info(
+    "Tender Tracker (Beta) — Free early access while we improve coverage, matching, translation, and alerts."
+)
 st.caption(f"Logged in as {user['email']}")
 st.button("Logout", on_click=logout)
 
@@ -73,11 +104,12 @@ limit = st.sidebar.slider("Max rows", 50, 2000, 500, step=50)
 search = st.sidebar.text_input("Search (title / CA)", value=profile["search_text"])
 bookmarks_only = st.sidebar.checkbox("Bookmarks only", value=False)
 
+source_options = ["All", "ETENDERS_GOV_IE", "TED"]
 source_filter = st.sidebar.selectbox(
     "Source",
-    ["All", "ETENDERS_GOV_IE", "TED"],
-    index=["All", "ETENDERS_GOV_IE", "TED"].index(profile["source_filter"])
-    if profile["source_filter"] in ["All", "ETENDERS_GOV_IE", "TED"]
+    source_options,
+    index=source_options.index(profile["source_filter"])
+    if profile["source_filter"] in source_options
     else 0,
 )
 
@@ -88,7 +120,7 @@ only_with_deadline = st.sidebar.checkbox(
     "Only tenders with a deadline",
     value=bool(profile["only_with_deadline"]),
 )
-due_within = st.sidebar.slider("Due within (days)", 0, 180, int(profile["due_within"]))
+due_within = st.sidebar.slider("Due within (days)", 0, 365, int(profile["due_within"]))
 
 sort_options = [
     "priority desc (recommended)",
@@ -118,36 +150,42 @@ if st.sidebar.button("Save my filters"):
     st.sidebar.success("Filters saved")
 
 order_sql = {
-    "priority desc (recommended)": "priority DESC, m.score DESC, t.published_at DESC",
-    "score desc": "m.score DESC, t.published_at DESC",
-    "deadline asc": "CASE WHEN t.deadline_at IS NULL THEN 1 ELSE 0 END, t.deadline_at ASC, m.score DESC",
-    "published desc": "t.published_at DESC, m.score DESC",
+    "priority desc (recommended)": "priority DESC, score DESC, published_at DESC",
+    "score desc": "score DESC, published_at DESC",
+    "deadline asc": "CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END, deadline_at ASC, score DESC",
+    "published desc": "published_at DESC, score DESC",
 }[sort_by]
 
+placeholder = ph()
 params = [profile_name, min_score]
 
 search_sql = ""
 if search.strip():
-    search_sql = " AND (lower(t.title) LIKE lower(?) OR lower(coalesce(t.ca,'')) LIKE lower(?)) "
+    search_sql = (
+        f" AND (lower(t.title) LIKE lower({placeholder}) OR lower(coalesce(t.ca,'')) LIKE lower({placeholder})) "
+    )
     params.extend([f"%{search.strip()}%", f"%{search.strip()}%"])
 
 source_sql = ""
 if source_filter != "All":
-    source_sql = " AND t.source = ? "
+    source_sql = f" AND t.source = {placeholder} "
     params.append(source_filter)
 
 country_sql = ""
 if country_filter.strip():
-    country_sql = " AND lower(coalesce(t.country,'')) = lower(?) "
+    country_sql = f" AND lower(coalesce(t.country,'')) = lower({placeholder}) "
     params.append(country_filter.strip())
 
 cpv_sql = ""
 if cpv_filter.strip():
-    cpv_sql = " AND coalesce(t.cpv_code,'') LIKE ? "
+    cpv_sql = f" AND coalesce(t.cpv_code,'') LIKE {placeholder} "
     params.append(f"{cpv_filter.strip()}%")
 
 params.append(limit)
 
+# -------------------------
+# Main query
+# -------------------------
 sql = f"""
 SELECT
   t.source,
@@ -186,46 +224,50 @@ SELECT
 FROM tender_matches m
 JOIN tenders t
   ON t.source = m.source AND t.source_id = m.source_id
-WHERE m.profile_name = ?
-  AND m.score >= ?
+WHERE m.profile_name = {placeholder}
+  AND m.score >= {placeholder}
   {search_sql}
   {source_sql}
   {country_sql}
   {cpv_sql}
 ORDER BY {order_sql}
-LIMIT ?;
+LIMIT {placeholder};
 """
 
-with sqlite3.connect(DB_PATH) as conn:
-    df = pd.read_sql_query(sql, conn, params=params)
+df = fetch_df(sql, params)
 
+# -------------------------
+# Dataframe filters
+# -------------------------
 if only_with_deadline:
     df = df[df["deadline_at"].notna()]
 
 if "due_days" in df.columns:
-    df = df[df["due_days"].notna()]
-    df = df[df["due_days"].between(0, due_within)]
+    df["due_days"] = pd.to_numeric(df["due_days"], errors="coerce")
+    if only_with_deadline:
+        df = df[df["due_days"].notna()]
+        df = df[df["due_days"].between(0, due_within)]
 
 if bookmarks_only:
-    with sqlite3.connect(DB_PATH) as conn:
-        bookmarks_df = pd.read_sql_query(
-            """
-            SELECT source, source_id
-            FROM user_bookmarks
-            WHERE user_id = ?
-            """,
-            conn,
-            params=[user_id],
-        )
+    bookmarks_sql = f"""
+    SELECT source, source_id
+    FROM user_bookmarks
+    WHERE user_id = {placeholder}
+    """
+    bookmarks_df = fetch_df(bookmarks_sql, [user_id])
     if not bookmarks_df.empty:
         df = df.merge(bookmarks_df, on=["source", "source_id"], how="inner")
     else:
         df = df.iloc[0:0]
 
 if df.empty:
-    st.warning("No results for these filters.")
+    st.warning("No results for your current filters.")
+    st.caption("Tip: lower minimum score, turn off deadline-only, or switch Source to All.")
     st.stop()
 
+# -------------------------
+# Bookmark UI
+# -------------------------
 st.subheader("Bookmark a tender")
 
 options = df[["source", "source_id", "title"]].copy()
@@ -240,15 +282,14 @@ choice = st.selectbox(
 selected_source = options.loc[choice, "source"]
 selected_source_id = options.loc[choice, "source_id"]
 
-with sqlite3.connect(DB_PATH) as conn:
-    row = conn.execute(
-        """
-        SELECT 1
-        FROM user_bookmarks
-        WHERE user_id = ? AND source = ? AND source_id = ?
-        """,
-        (user_id, selected_source, selected_source_id),
-    ).fetchone()
+bookmark_sql = f"""
+SELECT 1
+FROM user_bookmarks
+WHERE user_id = {placeholder}
+  AND source = {placeholder}
+  AND source_id = {placeholder}
+"""
+row = fetch_one(bookmark_sql, [user_id, selected_source, selected_source_id])
 
 current = row is not None
 new_value = st.checkbox("Bookmarked", value=current)
@@ -258,9 +299,12 @@ if new_value != current:
     st.success("Bookmark updated")
     st.rerun()
 
+# -------------------------
+# Display prep
+# -------------------------
 df["link"] = df["link"].astype(str)
 
-for col in ["score", "urgency", "priority", "due_days"]:
+for col in ["score", "urgency", "priority"]:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -277,6 +321,9 @@ st.dataframe(
     },
 )
 
+# -------------------------
+# Stats
+# -------------------------
 st.divider()
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Rows", len(df_view))

@@ -7,3 +7,5 @@ python-dateutil
 resend
 python-dotenv
 openai
+psycopg[binary]
+psycopg2-binary
