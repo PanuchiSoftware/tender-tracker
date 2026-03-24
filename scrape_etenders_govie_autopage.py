@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
 from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
+from db import get_conn, is_postgres
 
 import requests
 from bs4 import BeautifulSoup

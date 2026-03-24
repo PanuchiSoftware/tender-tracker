@@ -1,154 +1,163 @@
 import json
-import re
-import sqlite3
-from dataclasses import dataclass
-from datetime import datetime
-from typing import List, Dict, Any, Tuple, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Tuple
 
-DB_PATH = "tenders.db"
+from db import get_conn
+
 PROFILE_PATH = "profile.json"
 
 
-@dataclass
-class Keyword:
-    term: str
-    weight: int
+def ensure_tender_matches_table() -> None:
+    ddl = """
+    CREATE TABLE IF NOT EXISTS tender_matches (
+        id SERIAL PRIMARY KEY,
+        profile_name TEXT NOT NULL,
+        source TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        score INTEGER NOT NULL,
+        matched_terms TEXT,
+        computed_at TEXT NOT NULL,
+        UNIQUE(profile_name, source, source_id)
+    )
+    """
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(ddl)
+        conn.commit()
 
 
-def load_profile(path: str) -> Tuple[str, List[Keyword], List[str]]:
-    with open(path, "r", encoding="utf-8") as f:
+def load_profiles() -> List[Dict[str, Any]]:
+    with open(PROFILE_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    name = data.get("name", "Profile")
-    keywords = [Keyword(k["term"].lower().strip(), int(k.get("weight", 1))) for k in data.get("keywords", [])]
-    exclude = [x.lower().strip() for x in data.get("exclude", [])]
-    return name, keywords, exclude
+    if isinstance(data, dict) and "profiles" in data:
+        return data["profiles"]
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict) and "name" in data:
+        return [data]
+
+    raise ValueError("profile.json format not recognised")
 
 
-def normalize(text: Optional[str]) -> str:
-    if not text:
-        return ""
-    return re.sub(r"\s+", " ", text).strip().lower()
+def normalize_profile(profile: Dict[str, Any]) -> Tuple[str, List[Tuple[str, int]], List[str]]:
+    name = profile.get("name", "Default")
+    raw_keywords = profile.get("keywords", [])
+    raw_exclude = profile.get("exclude", [])
+
+    keywords: List[Tuple[str, int]] = []
+    for item in raw_keywords:
+        if isinstance(item, str):
+            keywords.append((item.strip().lower(), 1))
+        elif isinstance(item, dict):
+            term = str(item.get("term", "")).strip().lower()
+            weight = int(item.get("weight", 1))
+            if term:
+                keywords.append((term, weight))
+
+    exclude_terms = [str(x).strip().lower() for x in raw_exclude if str(x).strip()]
+    return name, keywords, exclude_terms
 
 
-def score_text(text: str, keywords: List[Keyword]) -> Tuple[int, List[str]]:
-    """
-    Score:
-    - If keyword term appears in text -> add weight
-    - Return UNIQUE matched terms (no duplicates)
-    """
-    score = 0
-    matched_set = []
-    seen = set()
-
-    for k in keywords:
-        if k.term and k.term in text:
-            score += k.weight
-            if k.term not in seen:
-                matched_set.append(k.term)
-                seen.add(k.term)
-
-    return score, matched_set
-
-
-def is_excluded(text: str, exclude_terms: List[str]) -> bool:
-    for x in exclude_terms:
-        if x and x in text:
-            return True
-    return False
-
-
-def ensure_match_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS tender_matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source TEXT NOT NULL,
-            source_id TEXT NOT NULL,
-            profile_name TEXT NOT NULL,
-            score INTEGER NOT NULL,
-            matched_terms TEXT,
-            computed_at TEXT NOT NULL,
-            UNIQUE(source, source_id, profile_name)
-        );
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_tender_matches_score ON tender_matches(score);")
-    conn.commit()
-
-
-def compute_matches(conn: sqlite3.Connection, profile_name: str, keywords: List[Keyword], exclude_terms: List[str]) -> int:
-    """
-    Compute score based ONLY on tender content fields (title + CA + estimated_value).
-    IMPORTANT: do NOT score URLs (they create false matches like 'api' from 'prepare').
-    """
-    ensure_match_table(conn)
-
-    cur = conn.execute(
-        """
-        SELECT source, source_id, title, ca, estimated_value, published_at
-        FROM tenders
-        WHERE source IN ('ETENDERS_GOV_IE', 'TED')
-        ORDER BY published_at DESC
-        LIMIT 500;
-        """
-    )
-    rows = cur.fetchall()
-
-    now = datetime.utcnow().isoformat()
-    upserts = 0
-
-    for source, source_id, title, ca, estimated_value, published_at in rows:
-        # Only real content fields:
-        blob = " ".join([normalize(title), normalize(ca), normalize(estimated_value)])
-
-        if is_excluded(blob, exclude_terms):
-            score = 0
-            matched_terms = []
-        else:
-            score, matched_terms = score_text(blob, keywords)
-
-        conn.execute(
+def fetch_tenders() -> List[Tuple[str, str, str, str, str, str]]:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
             """
-            INSERT INTO tender_matches (source, source_id, profile_name, score, matched_terms, computed_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source, source_id, profile_name) DO UPDATE SET
-                score=excluded.score,
-                matched_terms=excluded.matched_terms,
-                computed_at=excluded.computed_at
-            ;
-            """,
-            (source, source_id, profile_name, score, ", ".join(matched_terms), now),
+            SELECT
+                source,
+                source_id,
+                COALESCE(title, ''),
+                COALESCE(ca, ''),
+                COALESCE(cpv_code, ''),
+                COALESCE(country, '')
+            FROM tenders
+            WHERE source IN ('ETENDERS_GOV_IE', 'TED')
+            """
         )
-        upserts += 1
-
-    conn.commit()
-    return upserts
+        return cur.fetchall()
 
 
-def print_top(conn: sqlite3.Connection, profile_name: str, limit: int = 20) -> None:
-    cur = conn.execute(
-        """
-        SELECT m.score, m.matched_terms,
-               t.published_at, t.deadline_at, t.title, t.ca, t.estimated_value, t.link
-        FROM tender_matches m
-        JOIN tenders t
-          ON t.source = m.source AND t.source_id = m.source_id
-        WHERE m.profile_name = ?
-          AND t.source = 'ETENDERS_GOV_IE'
-        ORDER BY m.score DESC, t.published_at DESC
-        LIMIT ?;
-        """,
-        (profile_name, limit),
+def score_tender(text: str, keywords: List[Tuple[str, int]], exclude_terms: List[str]) -> Tuple[int, List[str]]:
+    score = 0
+    matched_terms: List[str] = []
+    haystack = text.lower()
+
+    for term in exclude_terms:
+        if term and term in haystack:
+            return 0, []
+
+    for term, weight in keywords:
+        if term and term in haystack:
+            score += weight
+            matched_terms.append(term)
+
+    return score, matched_terms
+
+
+def save_matches(profile_name: str, rows: List[Tuple[str, str, int, str]]) -> None:
+    ensure_tender_matches_table()
+    computed_at = datetime.now(timezone.utc).isoformat()
+
+    delete_sql = "DELETE FROM tender_matches WHERE profile_name = %s"
+
+    insert_sql = """
+    INSERT INTO tender_matches (
+        profile_name, source, source_id, score, matched_terms, computed_at
     )
-    rows = cur.fetchall()
+    VALUES (%s, %s, %s, %s, %s, %s)
+    ON CONFLICT (profile_name, source, source_id) DO UPDATE SET
+        score = EXCLUDED.score,
+        matched_terms = EXCLUDED.matched_terms,
+        computed_at = EXCLUDED.computed_at
+    """
+
+    payload = [
+        (profile_name, source, source_id, score, matched_terms, computed_at)
+        for source, source_id, score, matched_terms in rows
+    ]
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(delete_sql, (profile_name,))
+        if payload:
+            cur.executemany(insert_sql, payload)
+        conn.commit()
+
+
+def print_top(profile_name: str, limit: int = 20) -> None:
+    sql = """
+    SELECT
+        m.score,
+        t.published_at,
+        t.deadline_at,
+        t.title,
+        t.ca,
+        t.estimated_value,
+        m.matched_terms,
+        t.link
+    FROM tender_matches m
+    JOIN tenders t
+      ON t.source = m.source AND t.source_id = m.source_id
+    WHERE m.profile_name = %s
+    ORDER BY m.score DESC, t.published_at DESC NULLS LAST
+    LIMIT %s
+    """
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, (profile_name, limit))
+        rows = cur.fetchall()
 
     print(f"\nTop {len(rows)} relevant tenders for profile: {profile_name}\n")
-    for score, matched_terms, published_at, deadline_at, title, ca, estimated_value, link in rows:
+    for row in rows:
+        score, published_at, deadline_at, title, ca, estimated_value, matched_terms, link = row
         print(f"Score: {score} | Published: {published_at} | Deadline: {deadline_at}")
         print(f"Title: {title}")
-        if ca:
-            print(f"CA: {ca}")
+        print(f"CA: {ca}")
         if estimated_value:
             print(f"Est: {estimated_value}")
         if matched_terms:
@@ -157,12 +166,27 @@ def print_top(conn: sqlite3.Connection, profile_name: str, limit: int = 20) -> N
 
 
 def main() -> None:
-    profile_name, keywords, exclude_terms = load_profile(PROFILE_PATH)
+    profiles = load_profiles()
+    tenders = fetch_tenders()
 
-    with sqlite3.connect(DB_PATH) as conn:
-        n = compute_matches(conn, profile_name, keywords, exclude_terms)
-        print(f"Computed/updated matches for {n} tenders.")
-        print_top(conn, profile_name, limit=20)
+    total_written = 0
+
+    for profile in profiles:
+        profile_name, keywords, exclude_terms = normalize_profile(profile)
+        rows_to_save: List[Tuple[str, str, int, str]] = []
+
+        for source, source_id, title, ca, cpv_code, country in tenders:
+            combined_text = " | ".join([title, ca, cpv_code, country])
+            score, matched_terms = score_tender(combined_text, keywords, exclude_terms)
+            rows_to_save.append((source, source_id, score, ", ".join(matched_terms)))
+
+        save_matches(profile_name, rows_to_save)
+        total_written += len(rows_to_save)
+
+        print(f"Computed/updated matches for {len(rows_to_save)} tenders.")
+        print_top(profile_name, limit=20)
+
+    print(f"\nFinished. Total match rows written: {total_written}")
 
 
 if __name__ == "__main__":

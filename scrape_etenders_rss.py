@@ -1,4 +1,4 @@
-import sqlite3
+from db import get_conn
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, List
@@ -12,6 +12,10 @@ from dateutil import parser as dateparser
 SEARCH_URL = "https://www.etenders.gov.ie/epps/quickSearchAction.do?searchType=cftFTS"
 BASE_URL = "https://www.etenders.gov.ie"
 DB_PATH = "tenders.db"
+
+
+with get_conn() as conn:
+    cur = conn.cursor()
 
 
 @dataclass

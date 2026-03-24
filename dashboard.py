@@ -8,10 +8,9 @@ from auth import (
     save_user_profile,
     toggle_user_bookmark,
 )
-from db import get_conn, is_postgres, ph
+from db import get_conn
 
 st.set_page_config(page_title="Tender Tracker", layout="wide")
-
 
 
 def logout():
@@ -22,17 +21,20 @@ def logout():
 def fetch_df(sql: str, params=None) -> pd.DataFrame:
     if params is None:
         params = []
+
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(sql, params)
         rows = cur.fetchall()
         columns = [desc[0] for desc in cur.description]
+
     return pd.DataFrame(rows, columns=columns)
 
 
 def fetch_one(sql: str, params=None):
     if params is None:
         params = []
+
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(sql, params)
@@ -40,7 +42,7 @@ def fetch_one(sql: str, params=None):
 
 
 def login_ui():
-    st.title("Tender Tracker - Login")
+    st.title("Tender Tracker (Beta)")
     st.info(
         "Free early access while we improve coverage, matching, translation, and alerts."
     )
@@ -147,35 +149,40 @@ if st.sidebar.button("Save my filters"):
     st.sidebar.success("Filters saved")
 
 order_sql = {
-    "priority desc (recommended)": "priority DESC, score DESC, published_at DESC",
-    "score desc": "score DESC, published_at DESC",
+    "priority desc (recommended)": "priority DESC, score DESC, published_at DESC NULLS LAST",
+    "score desc": "score DESC, published_at DESC NULLS LAST",
     "deadline asc": "CASE WHEN deadline_at IS NULL THEN 1 ELSE 0 END, deadline_at ASC, score DESC",
-    "published desc": "published_at DESC, score DESC",
+    "published desc": "published_at DESC NULLS LAST, score DESC",
 }[sort_by]
 
-placeholder = ph()
+# -------------------------
+# Build SQL filters
+# -------------------------
 params = [profile_name, min_score]
 
 search_sql = ""
 if search.strip():
-    search_sql = (
-        f" AND (lower(t.title) LIKE lower({placeholder}) OR lower(coalesce(t.ca,'')) LIKE lower({placeholder})) "
-    )
+    search_sql = """
+      AND (
+        lower(t.title) LIKE lower(%s)
+        OR lower(coalesce(t.ca, '')) LIKE lower(%s)
+      )
+    """
     params.extend([f"%{search.strip()}%", f"%{search.strip()}%"])
 
 source_sql = ""
 if source_filter != "All":
-    source_sql = f" AND t.source = {placeholder} "
+    source_sql = " AND t.source = %s "
     params.append(source_filter)
 
 country_sql = ""
 if country_filter.strip():
-    country_sql = f" AND lower(coalesce(t.country,'')) = lower({placeholder}) "
+    country_sql = " AND lower(coalesce(t.country, '')) = lower(%s) "
     params.append(country_filter.strip())
 
 cpv_sql = ""
 if cpv_filter.strip():
-    cpv_sql = f" AND coalesce(t.cpv_code,'') LIKE {placeholder} "
+    cpv_sql = " AND coalesce(t.cpv_code, '') LIKE %s "
     params.append(f"{cpv_filter.strip()}%")
 
 params.append(limit)
@@ -189,25 +196,30 @@ SELECT
   t.source_id,
   m.score,
   m.matched_terms,
+  m.computed_at,
   t.published_at,
   t.deadline_at,
-  CAST(
-    (julianday(substr(t.deadline_at, 1, 19)) - julianday('now')) AS INTEGER
-  ) AS due_days,
+  CASE
+    WHEN t.deadline_at IS NULL THEN NULL
+    ELSE CAST(
+      EXTRACT(EPOCH FROM ((t.deadline_at)::timestamp - NOW())) / 86400
+      AS INTEGER
+    )
+  END AS due_days,
   CASE
     WHEN t.deadline_at IS NULL THEN 0
-    WHEN (julianday(substr(t.deadline_at, 1, 19)) - julianday('now')) <= 3 THEN 10
-    WHEN (julianday(substr(t.deadline_at, 1, 19)) - julianday('now')) <= 7 THEN 7
-    WHEN (julianday(substr(t.deadline_at, 1, 19)) - julianday('now')) <= 14 THEN 4
+    WHEN ((t.deadline_at)::timestamp - NOW()) <= INTERVAL '3 days' THEN 10
+    WHEN ((t.deadline_at)::timestamp - NOW()) <= INTERVAL '7 days' THEN 7
+    WHEN ((t.deadline_at)::timestamp - NOW()) <= INTERVAL '14 days' THEN 4
     ELSE 1
   END AS urgency,
   (
     m.score +
     CASE
       WHEN t.deadline_at IS NULL THEN 0
-      WHEN (julianday(substr(t.deadline_at, 1, 19)) - julianday('now')) <= 3 THEN 10
-      WHEN (julianday(substr(t.deadline_at, 1, 19)) - julianday('now')) <= 7 THEN 7
-      WHEN (julianday(substr(t.deadline_at, 1, 19)) - julianday('now')) <= 14 THEN 4
+      WHEN ((t.deadline_at)::timestamp - NOW()) <= INTERVAL '3 days' THEN 10
+      WHEN ((t.deadline_at)::timestamp - NOW()) <= INTERVAL '7 days' THEN 7
+      WHEN ((t.deadline_at)::timestamp - NOW()) <= INTERVAL '14 days' THEN 4
       ELSE 1
     END
   ) AS priority,
@@ -221,14 +233,14 @@ SELECT
 FROM tender_matches m
 JOIN tenders t
   ON t.source = m.source AND t.source_id = m.source_id
-WHERE m.profile_name = {placeholder}
-  AND m.score >= {placeholder}
+WHERE m.profile_name = %s
+  AND m.score >= %s
   {search_sql}
   {source_sql}
   {country_sql}
   {cpv_sql}
 ORDER BY {order_sql}
-LIMIT {placeholder};
+LIMIT %s;
 """
 
 df = fetch_df(sql, params)
@@ -246,12 +258,14 @@ if "due_days" in df.columns:
         df = df[df["due_days"].between(0, due_within)]
 
 if bookmarks_only:
-    bookmarks_sql = f"""
-    SELECT source, source_id
-    FROM user_bookmarks
-    WHERE user_id = {placeholder}
-    """
-    bookmarks_df = fetch_df(bookmarks_sql, [user_id])
+    bookmarks_df = fetch_df(
+        """
+        SELECT source, source_id
+        FROM user_bookmarks
+        WHERE user_id = %s
+        """,
+        [user_id],
+    )
     if not bookmarks_df.empty:
         df = df.merge(bookmarks_df, on=["source", "source_id"], how="inner")
     else:
@@ -279,14 +293,16 @@ choice = st.selectbox(
 selected_source = options.loc[choice, "source"]
 selected_source_id = options.loc[choice, "source_id"]
 
-bookmark_sql = f"""
-SELECT 1
-FROM user_bookmarks
-WHERE user_id = {placeholder}
-  AND source = {placeholder}
-  AND source_id = {placeholder}
-"""
-row = fetch_one(bookmark_sql, [user_id, selected_source, selected_source_id])
+row = fetch_one(
+    """
+    SELECT 1
+    FROM user_bookmarks
+    WHERE user_id = %s
+      AND source = %s
+      AND source_id = %s
+    """,
+    [user_id, selected_source, selected_source_id],
+)
 
 current = row is not None
 new_value = st.checkbox("Bookmarked", value=current)
@@ -301,7 +317,7 @@ if new_value != current:
 # -------------------------
 df["link"] = df["link"].astype(str)
 
-for col in ["score", "urgency", "priority"]:
+for col in ["score", "urgency", "priority", "due_days"]:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 

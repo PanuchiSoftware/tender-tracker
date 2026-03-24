@@ -1,15 +1,14 @@
-import sqlite3
+import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
-import xml.etree.ElementTree as ET
-import time
 
 import requests
 
-DB_PATH = "tenders.db"
-TED_SEARCH_URL = "https://api.ted.europa.eu/v3/notices/search"
+from db import get_conn
 
+TED_SEARCH_URL = "https://api.ted.europa.eu/v3/notices/search"
 PAGE_SIZE = 10
 MAX_PAGES = 5
 LOOKBACK_DAYS = 14
@@ -31,6 +30,22 @@ class Tender:
     cpv_code: Optional[str]
     cpv_label: Optional[str]
     source_url: Optional[str]
+    summary: Optional[str] = None
+
+
+def sql_ph() -> str:
+    return "%s" if is_postgres() else "?"
+
+
+def normalize_dt(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    value = str(value).strip()
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return value
 
 
 def expert_query() -> str:
@@ -68,17 +83,6 @@ def post_search(page: int) -> Dict[str, Any]:
 
 def extract_items(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return payload.get("notices", [])
-
-
-def normalize_dt(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    value = str(value).strip()
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return dt.astimezone(timezone.utc).isoformat()
-    except Exception:
-        return value
 
 
 def fetch_notice_xml(xml_url: str) -> Optional[ET.Element]:
@@ -148,32 +152,27 @@ def find_text_under_path(root: ET.Element, parent_names: List[str], target_names
 
 
 def parse_notice_detail_xml(root: ET.Element) -> Dict[str, Optional[str]]:
-    # Better title extraction
     title = (
         find_text_under_path(root, ["ProcurementProjectLot", "ProcurementProject"], ["Name", "Title"])
         or find_text_under_path(root, ["TenderResult"], ["Description"])
         or None
     )
 
-    # Dates
     publication_date = first_text_by_localname(root, ["PublicationDate", "IssueDate"])
     deadline_date = first_text_by_localname(root, ["ReceiptDeadlineDate", "EndDate"])
 
-    # Buyer / authority
-    buyer_name = find_text_under_path(root, ["ContractingParty", "Organization", "PartyName"], ["Name"]) \
+    buyer_name = (
+        find_text_under_path(root, ["ContractingParty", "Organization", "PartyName"], ["Name"])
         or first_text_by_localname(root, ["Name"])
+    )
 
-    # Country
     country = first_text_by_localname(root, ["IdentificationCode"])
-
-    # CPV
     cpv_codes = all_texts_by_localname(root, ["ItemClassificationCode"])
     cpv_code = cpv_codes[0] if cpv_codes else None
 
-    # Estimated value
     estimated_value = first_text_by_localname(
         root,
-        ["EstimatedOverallContractAmount", "ValueAmount", "PayableAmount"]
+        ["EstimatedOverallContractAmount", "ValueAmount", "PayableAmount"],
     )
 
     return {
@@ -213,21 +212,9 @@ def parse_notice(item: Dict[str, Any]) -> Tender:
     }
 
     if xml_url:
-        time.sleep(0.4)
+        time.sleep(0.5)
         root = fetch_notice_xml(xml_url)
         if root is not None:
-            # DEBUG: print the first few XML tags for the first notice
-            if notice_id == "120581-2026":
-                print("\nFIRST XML TAGS SAMPLE:\n")
-                seen = []
-                for el in root.iter():
-                    tag_name = local_name(el.tag)
-                    if tag_name not in seen:
-                        seen.append(tag_name)
-                    if len(seen) >= 80:
-                        break
-                print(seen)
-    
             detail = parse_notice_detail_xml(root)
 
     title = detail["title"] or f"TED Notice {notice_id}"
@@ -247,18 +234,19 @@ def parse_notice(item: Dict[str, Any]) -> Tender:
         cpv_code=detail["cpv_code"],
         cpv_label=None,
         source_url=source_url,
+        summary=None,
     )
 
 
-def init_db(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
+def ensure_tenders_table() -> None:
+    if is_postgres():
+        ddl = """
         CREATE TABLE IF NOT EXISTS tenders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             source TEXT NOT NULL,
             source_id TEXT NOT NULL,
             title TEXT NOT NULL,
-            link TEXT NOT NULL,
+            link TEXT,
             ca TEXT,
             published_at TEXT,
             deadline_at TEXT,
@@ -269,79 +257,137 @@ def init_db(conn: sqlite3.Connection) -> None:
             cpv_code TEXT,
             cpv_label TEXT,
             source_url TEXT,
-            first_seen_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
+            summary TEXT,
             UNIQUE(source, source_id)
-        );
-        """
-    )
-    conn.commit()
-
-
-def upsert(conn: sqlite3.Connection, tenders: List[Tender]) -> int:
-    now = datetime.now(timezone.utc).isoformat()
-
-    for t in tenders:
-        conn.execute(
-            """
-            INSERT INTO tenders (
-                source, source_id, title, link, ca, published_at, deadline_at,
-                status, estimated_value, notice_id, country, cpv_code, cpv_label,
-                source_url, first_seen_at, last_seen_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source, source_id) DO UPDATE SET
-                title=excluded.title,
-                link=excluded.link,
-                ca=excluded.ca,
-                published_at=excluded.published_at,
-                deadline_at=excluded.deadline_at,
-                status=excluded.status,
-                estimated_value=excluded.estimated_value,
-                notice_id=excluded.notice_id,
-                country=excluded.country,
-                cpv_code=excluded.cpv_code,
-                cpv_label=excluded.cpv_label,
-                source_url=excluded.source_url,
-                last_seen_at=excluded.last_seen_at
-            ;
-            """,
-            (
-                t.source,
-                t.source_id,
-                t.title,
-                t.link,
-                t.ca,
-                t.published_at,
-                t.deadline_at,
-                t.status,
-                t.estimated_value,
-                t.notice_id,
-                t.country,
-                t.cpv_code,
-                t.cpv_label,
-                t.source_url,
-                now,
-                now,
-            ),
         )
-
-    conn.commit()
-    return len(tenders)
-
-
-def print_latest(conn: sqlite3.Connection, limit: int = 10) -> None:
-    cur = conn.execute(
         """
-        SELECT published_at, country, cpv_code, title, ca, link
-        FROM tenders
-        WHERE source = 'TED'
-        ORDER BY rowid DESC
-        LIMIT ?;
-        """,
-        (limit,),
-    )
-    rows = cur.fetchall()
+    else:
+        ddl = """
+        CREATE TABLE IF NOT EXISTS tenders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            link TEXT,
+            ca TEXT,
+            published_at TEXT,
+            deadline_at TEXT,
+            status TEXT,
+            estimated_value TEXT,
+            notice_id TEXT,
+            country TEXT,
+            cpv_code TEXT,
+            cpv_label TEXT,
+            source_url TEXT,
+            summary TEXT,
+            UNIQUE(source, source_id)
+        )
+        """
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(ddl)
+        conn.commit()
+
+
+def upsert_tenders(tenders: List[Tender]) -> int:
+    if not tenders:
+        return 0
+
+    ensure_tenders_table()
+    p = sql_ph()
+
+    if is_postgres():
+        sql = """
+        INSERT INTO tenders (
+            source, source_id, title, link, ca, published_at, deadline_at,
+            status, estimated_value, notice_id, country, cpv_code, cpv_label,
+            source_url, summary
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (source, source_id) DO UPDATE SET
+            title = EXCLUDED.title,
+            link = EXCLUDED.link,
+            ca = EXCLUDED.ca,
+            published_at = EXCLUDED.published_at,
+            deadline_at = EXCLUDED.deadline_at,
+            status = EXCLUDED.status,
+            estimated_value = EXCLUDED.estimated_value,
+            notice_id = EXCLUDED.notice_id,
+            country = EXCLUDED.country,
+            cpv_code = EXCLUDED.cpv_code,
+            cpv_label = EXCLUDED.cpv_label,
+            source_url = EXCLUDED.source_url,
+            summary = COALESCE(tenders.summary, EXCLUDED.summary)
+        """
+    else:
+        sql = """
+        INSERT INTO tenders (
+            source, source_id, title, link, ca, published_at, deadline_at,
+            status, estimated_value, notice_id, country, cpv_code, cpv_label,
+            source_url, summary
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source, source_id) DO UPDATE SET
+            title = excluded.title,
+            link = excluded.link,
+            ca = excluded.ca,
+            published_at = excluded.published_at,
+            deadline_at = excluded.deadline_at,
+            status = excluded.status,
+            estimated_value = excluded.estimated_value,
+            notice_id = excluded.notice_id,
+            country = excluded.country,
+            cpv_code = excluded.cpv_code,
+            cpv_label = excluded.cpv_label,
+            source_url = excluded.source_url,
+            summary = COALESCE(tenders.summary, excluded.summary)
+        """
+
+    rows = [
+        (
+            t.source,
+            t.source_id,
+            t.title,
+            t.link,
+            t.ca,
+            t.published_at,
+            t.deadline_at,
+            t.status,
+            t.estimated_value,
+            t.notice_id,
+            t.country,
+            t.cpv_code,
+            t.cpv_label,
+            t.source_url,
+            t.summary,
+        )
+        for t in tenders
+    ]
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.executemany(sql, rows)
+        conn.commit()
+
+    return len(rows)
+
+
+def print_latest(limit: int = 10) -> None:
+    p = sql_ph()
+    sql = f"""
+    SELECT published_at, country, cpv_code, title, ca, link
+    FROM tenders
+    WHERE source = {p}
+    ORDER BY published_at DESC NULLS LAST, id DESC
+    LIMIT {p}
+    """
+    params = ["TED", limit]
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
 
     print(f"\nLatest {len(rows)} TED notices:\n")
     for published_at, country, cpv_code, title, ca, link in rows:
@@ -352,7 +398,7 @@ def print_latest(conn: sqlite3.Connection, limit: int = 10) -> None:
         print(f"  {link}\n")
 
 
-def main():
+def main() -> None:
     all_tenders: List[Tender] = []
 
     for page in range(1, MAX_PAGES + 1):
@@ -380,11 +426,9 @@ def main():
         dedup[(t.source, t.source_id)] = t
     unique = list(dedup.values())
 
-    with sqlite3.connect(DB_PATH) as conn:
-        init_db(conn)
-        n = upsert(conn, unique)
-        print(f"Upserted {n} TED notices into {DB_PATH}")
-        print_latest(conn)
+    count = upsert_tenders(unique)
+    print(f"Upserted {count} TED notices.")
+    print_latest()
 
 
 if __name__ == "__main__":
